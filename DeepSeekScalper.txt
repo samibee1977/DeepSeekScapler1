@@ -1,0 +1,418 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.SuperDom;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.Core.FloatingPoint;
+using NinjaTrader.NinjaScript.Indicators;
+using NinjaTrader.NinjaScript.DrawingTools;
+#endregion
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+        public class DeepSeekScalper : Strategy
+        {
+                private EMA ema8;
+                private EMA ema13;
+                private EMA ema21;
+                private EMA ema34;
+                private RSI rsi3;
+                private VWAP vwap;
+                private VOL vol;
+                
+                private double prevDayHigh;
+                private double prevDayLow;
+                private double prevDayClose;
+                private double todayOpen;
+                private double preMarketHigh;
+                private double preMarketLow;
+                
+                private bool inMorningSession;
+                private bool inAfternoonSession;
+                private bool inTradingWindow;
+                
+                private double avgVolume;
+                private int volumeBars;
+
+                protected override void OnStateChange()
+                {
+                        if (State == State.SetDefaults)
+                        {
+                                Description = @"10-tick scalper based on DeepSeek framework: EMA pullbacks, RSI mean reversion, VWAP breakouts";
+                                Name = "DeepSeekScalper";
+                                Calculate = Calculate.OnBarClose;
+                                EntriesPerDirection = 1;
+                                EntryHandling = EntryHandling.AllEntries;
+                                IsExitOnSessionCloseStrategy = true;
+                                ExitOnSessionCloseSeconds = 30;
+                                IsFillLimitOnTouch = false;
+                                MaximumBarsLookBack = MaximumBarsLookBack.TwoHundredFiftySix;
+                                OrderFillResolution = OrderFillResolution.Standard;
+                                Slippage = 0;
+                                StartBehavior = StartBehavior.WaitUntilFlat;
+                                TimeInForce = TimeInForce.Gtc;
+                                TraceOrders = false;
+                                RealtimeErrorHandling = RealtimeErrorHandling.StopCancelClose;
+                                StopTargetHandling = StopTargetHandling.PerEntryExecution;
+                                BarsRequiredToTrade = 40;
+                                IsInstantiatedOnEachOptimizationIteration = true;
+                                
+                                ProfitTargetTicks = 10;
+                                StopLossTicks = 5;
+                                
+                                MorningSessionStart = new TimeSpan(8, 30, 0);
+                                MorningSessionEnd = new TimeSpan(10, 30, 0);
+                                AfternoonSessionStart = new TimeSpan(14, 0, 0);
+                                AfternoonSessionEnd = new TimeSpan(15, 0, 0);
+                                
+                                UseStrategyA_MeanReversion = true;
+                                UseStrategyB_Breakout = true;
+                                
+                                RsiOversoldLevel = 25;
+                                RsiOverboughtLevel = 75;
+                                
+                                VolumeMultiplier = 1.2;
+                                
+                                EnablePreviousDayLevels = true;
+                                EnablePreMarketLevels = true;
+                                
+                                PreMarketStartHour = 4;
+                                PreMarketEndHour = 9;
+                                PreMarketEndMinute = 30;
+                        }
+                        else if (State == State.Configure)
+                        {
+                                SetProfitTarget(CalculationMode.Ticks, ProfitTargetTicks);
+                                SetStopLoss(CalculationMode.Ticks, StopLossTicks, false);
+                        }
+                        else if (State == State.DataLoaded)
+                        {
+                                ema8 = EMA(8);
+                                ema13 = EMA(13);
+                                ema21 = EMA(21);
+                                ema34 = EMA(34);
+                                rsi3 = RSI(3, 1);
+                                vwap = VWAP(VWAPResolution.Standard, TradingHours.String2TradingHours("Default 24 x 7"));
+                                vol = VOL();
+                                
+                                ema8.Plots[0].Brush = Brushes.Cyan;
+                                ema13.Plots[0].Brush = Brushes.Green;
+                                ema21.Plots[0].Brush = Brushes.Orange;
+                                ema34.Plots[0].Brush = Brushes.Red;
+                                
+                                AddChartIndicator(ema8);
+                                AddChartIndicator(ema13);
+                                AddChartIndicator(ema21);
+                                AddChartIndicator(ema34);
+                                AddChartIndicator(vwap);
+                                
+                                prevDayHigh = 0;
+                                prevDayLow = 0;
+                                prevDayClose = 0;
+                                todayOpen = 0;
+                                preMarketHigh = 0;
+                                preMarketLow = 0;
+                                
+                                avgVolume = 0;
+                                volumeBars = 0;
+                        }
+                }
+
+                protected override void OnBarUpdate()
+                {
+                        if (CurrentBar < BarsRequiredToTrade)
+                                return;
+                        
+                        UpdateSessionTracking();
+                        UpdateDailyLevels();
+                        UpdateVolumeAverage();
+                        
+                        if (!inTradingWindow)
+                                return;
+                        
+                        if (Position.MarketPosition == MarketPosition.Flat)
+                        {
+                                if (UseStrategyA_MeanReversion)
+                                {
+                                        CheckStrategyA_MeanReversion();
+                                }
+                                
+                                if (UseStrategyB_Breakout)
+                                {
+                                        CheckStrategyB_Breakout();
+                                }
+                        }
+                }
+                
+                private void UpdateSessionTracking()
+                {
+                        TimeSpan currentTime = Time[0].TimeOfDay;
+                        
+                        inMorningSession = (currentTime >= MorningSessionStart && currentTime <= MorningSessionEnd);
+                        inAfternoonSession = (currentTime >= AfternoonSessionStart && currentTime <= AfternoonSessionEnd);
+                        inTradingWindow = inMorningSession || inAfternoonSession;
+                }
+                
+                private void UpdateDailyLevels()
+                {
+                        if (Bars.IsFirstBarOfSession && EnablePreviousDayLevels)
+                        {
+                                if (CurrentBar > 0)
+                                {
+                                        int barsBack = 1;
+                                        while (barsBack < CurrentBar && Time[barsBack].Date == Time[0].Date)
+                                        {
+                                                barsBack++;
+                                        }
+                                        
+                                        if (barsBack < CurrentBar)
+                                        {
+                                                prevDayClose = Close[barsBack];
+                                                
+                                                int dayStartBar = barsBack;
+                                                prevDayHigh = High[barsBack];
+                                                prevDayLow = Low[barsBack];
+                                                
+                                                for (int i = barsBack; i < CurrentBar && Time[i].Date == Time[barsBack].Date; i++)
+                                                {
+                                                        if (High[i] > prevDayHigh) prevDayHigh = High[i];
+                                                        if (Low[i] < prevDayLow) prevDayLow = Low[i];
+                                                }
+                                                
+                                                Print(string.Format("{0}: Previous Day - High: {1:F2}, Low: {2:F2}, Close: {3:F2}", 
+                                                        Time[0], prevDayHigh, prevDayLow, prevDayClose));
+                                        }
+                                }
+                                
+                                todayOpen = Open[0];
+                                Print(string.Format("{0}: Today Open: {1:F2}", Time[0], todayOpen));
+                        }
+                        
+                        if (EnablePreMarketLevels)
+                        {
+                                TimeSpan currentTime = Time[0].TimeOfDay;
+                                TimeSpan preMarketStart = new TimeSpan(PreMarketStartHour, 0, 0);
+                                TimeSpan preMarketEnd = new TimeSpan(PreMarketEndHour, PreMarketEndMinute, 0);
+                                
+                                if (currentTime >= preMarketStart && currentTime < preMarketEnd)
+                                {
+                                        if (preMarketHigh == 0 || High[0] > preMarketHigh)
+                                                preMarketHigh = High[0];
+                                        if (preMarketLow == 0 || Low[0] < preMarketLow)
+                                                preMarketLow = Low[0];
+                                }
+                                
+                                if (currentTime >= preMarketEnd && preMarketHigh > 0)
+                                {
+                                        if (Bars.IsFirstBarOfSession)
+                                        {
+                                                Print(string.Format("{0}: Pre-Market - High: {1:F2}, Low: {2:F2}", 
+                                                        Time[0], preMarketHigh, preMarketLow));
+                                        }
+                                }
+                        }
+                }
+                
+                private void UpdateVolumeAverage()
+                {
+                        if (vol[0] > 0)
+                        {
+                                avgVolume = ((avgVolume * volumeBars) + vol[0]) / (volumeBars + 1);
+                                volumeBars++;
+                        }
+                }
+                
+                private bool IsVolumeConfirmed()
+                {
+                        if (volumeBars < 20)
+                                return true;
+                        
+                        return vol[0] >= (avgVolume * VolumeMultiplier);
+                }
+                
+                private void CheckStrategyA_MeanReversion()
+                {
+                        bool bullishContext = Close[0] > ema34[0];
+                        bool bearishContext = Close[0] < ema34[0];
+                        
+                        if (bullishContext)
+                        {
+                                bool pullbackToEMA = Low[0] <= ema13[0] && Close[0] >= ema8[0];
+                                bool rsiOversold = rsi3[0] < RsiOversoldLevel;
+                                bool bullishCandle = Close[0] > Open[0];
+                                bool volumeConfirm = IsVolumeConfirmed();
+                                
+                                if (pullbackToEMA && rsiOversold && bullishCandle && volumeConfirm)
+                                {
+                                        EnterLong("StratA_Long");
+                                        
+                                        Print(string.Format("{0}: LONG Entry (Strategy A) - Price: {1:F2}, RSI: {2:F1}, Vol: {3}", 
+                                                Time[0], Close[0], rsi3[0], vol[0]));
+                                }
+                        }
+                        else if (bearishContext)
+                        {
+                                bool pullbackToEMA = High[0] >= ema13[0] && Close[0] <= ema8[0];
+                                bool rsiOverbought = rsi3[0] > RsiOverboughtLevel;
+                                bool bearishCandle = Close[0] < Open[0];
+                                bool volumeConfirm = IsVolumeConfirmed();
+                                
+                                if (pullbackToEMA && rsiOverbought && bearishCandle && volumeConfirm)
+                                {
+                                        EnterShort("StratA_Short");
+                                        
+                                        Print(string.Format("{0}: SHORT Entry (Strategy A) - Price: {1:F2}, RSI: {2:F1}, Vol: {3}", 
+                                                Time[0], Close[0], rsi3[0], vol[0]));
+                                }
+                        }
+                }
+                
+		private void CheckStrategyB_Breakout()
+		{
+			if (CurrentBar < 2)
+				return;
+			
+			bool aboveVWAP = Close[0] > vwap[0];
+			bool belowVWAP = Close[0] < vwap[0];
+			
+			if (aboveVWAP && Close[0] > ema21[0])
+			{
+				bool breakoutOccurred = false;
+				
+				if (EnablePreMarketLevels && preMarketHigh > 0 && Close[1] > preMarketHigh && Close[2] <= preMarketHigh)
+					breakoutOccurred = true;
+				else if (EnablePreviousDayLevels && prevDayHigh > 0 && Close[1] > prevDayHigh && Close[2] <= prevDayHigh)
+					breakoutOccurred = true;
+				else if (Close[1] > High[2])
+					breakoutOccurred = true;
+				
+				bool pullbackToVWAP = Low[0] <= vwap[0] * 1.001 && Close[0] > vwap[0];
+				bool bullishCandle = Close[0] > Open[0];
+				bool volumeConfirm = IsVolumeConfirmed();
+				
+				if (breakoutOccurred && pullbackToVWAP && bullishCandle && volumeConfirm)
+				{
+					EnterLong("StratB_Long");
+					
+					Print(string.Format("{0}: LONG Entry (Strategy B Breakout) - Price: {1:F2}, VWAP: {2:F2}, Vol: {3}", 
+						Time[0], Close[0], vwap[0], vol[0]));
+				}
+			}
+			else if (belowVWAP && Close[0] < ema21[0])
+			{
+				bool breakoutOccurred = false;
+				
+				if (EnablePreMarketLevels && preMarketLow > 0 && Close[1] < preMarketLow && Close[2] >= preMarketLow)
+					breakoutOccurred = true;
+				else if (EnablePreviousDayLevels && prevDayLow > 0 && Close[1] < prevDayLow && Close[2] >= prevDayLow)
+					breakoutOccurred = true;
+				else if (Close[1] < Low[2])
+					breakoutOccurred = true;
+				
+				bool pullbackToVWAP = High[0] >= vwap[0] * 0.999 && Close[0] < vwap[0];
+				bool bearishCandle = Close[0] < Open[0];
+				bool volumeConfirm = IsVolumeConfirmed();
+				
+				if (breakoutOccurred && pullbackToVWAP && bearishCandle && volumeConfirm)
+				{
+					EnterShort("StratB_Short");
+					
+					Print(string.Format("{0}: SHORT Entry (Strategy B Breakout) - Price: {1:F2}, VWAP: {2:F2}, Vol: {3}", 
+						Time[0], Close[0], vwap[0], vol[0]));
+				}
+			}
+		}
+		#region Properties
+		
+		[NinjaScriptProperty]
+                [Display(Name="Profit Target (Ticks)", Description="Profit target in ticks", Order=1, GroupName="1) Risk Management")]
+                public int ProfitTargetTicks { get; set; }
+
+                [NinjaScriptProperty]
+                [Range(1, int.MaxValue)]
+                [Display(Name="Stop Loss (Ticks)", Description="Stop loss in ticks", Order=2, GroupName="1) Risk Management")]
+                public int StopLossTicks { get; set; }
+                
+                [NinjaScriptProperty]
+                [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+                [Display(Name="Morning Session Start", Description="Morning trading window start time", Order=1, GroupName="2) Session Times")]
+                public TimeSpan MorningSessionStart { get; set; }
+
+                [NinjaScriptProperty]
+                [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+                [Display(Name="Morning Session End", Description="Morning trading window end time", Order=2, GroupName="2) Session Times")]
+                public TimeSpan MorningSessionEnd { get; set; }
+
+                [NinjaScriptProperty]
+                [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+                [Display(Name="Afternoon Session Start", Description="Afternoon trading window start time", Order=3, GroupName="2) Session Times")]
+                public TimeSpan AfternoonSessionStart { get; set; }
+
+                [NinjaScriptProperty]
+                [PropertyEditor("NinjaTrader.Gui.Tools.TimeEditorKey")]
+                [Display(Name="Afternoon Session End", Description="Afternoon trading window end time", Order=4, GroupName="2) Session Times")]
+                public TimeSpan AfternoonSessionEnd { get; set; }
+                
+                [NinjaScriptProperty]
+                [Display(Name="Use Strategy A (Mean Reversion)", Description="Enable EMA pullback + RSI strategy", Order=1, GroupName="3) Strategy Selection")]
+                public bool UseStrategyA_MeanReversion { get; set; }
+
+                [NinjaScriptProperty]
+                [Display(Name="Use Strategy B (Breakout)", Description="Enable VWAP breakout/pullback strategy", Order=2, GroupName="3) Strategy Selection")]
+                public bool UseStrategyB_Breakout { get; set; }
+                
+                [NinjaScriptProperty]
+                [Range(1, 100)]
+                [Display(Name="RSI Oversold Level", Description="RSI level for oversold condition", Order=1, GroupName="4) Indicator Settings")]
+                public int RsiOversoldLevel { get; set; }
+
+                [NinjaScriptProperty]
+                [Range(1, 100)]
+                [Display(Name="RSI Overbought Level", Description="RSI level for overbought condition", Order=2, GroupName="4) Indicator Settings")]
+                public int RsiOverboughtLevel { get; set; }
+                
+                [NinjaScriptProperty]
+                [Range(0.1, 10)]
+                [Display(Name="Volume Multiplier", Description="Volume must be this times average for confirmation", Order=3, GroupName="4) Indicator Settings")]
+                public double VolumeMultiplier { get; set; }
+                
+                [NinjaScriptProperty]
+                [Display(Name="Enable Previous Day Levels", Description="Track and use previous day high/low", Order=1, GroupName="5) Key Levels")]
+                public bool EnablePreviousDayLevels { get; set; }
+
+                [NinjaScriptProperty]
+                [Display(Name="Enable Pre-Market Levels", Description="Track and use pre-market high/low", Order=2, GroupName="5) Key Levels")]
+                public bool EnablePreMarketLevels { get; set; }
+                
+                [NinjaScriptProperty]
+                [Range(0, 23)]
+                [Display(Name="Pre-Market Start Hour", Description="Hour when pre-market tracking begins", Order=3, GroupName="5) Key Levels")]
+                public int PreMarketStartHour { get; set; }
+
+                [NinjaScriptProperty]
+                [Range(0, 23)]
+                [Display(Name="Pre-Market End Hour", Description="Hour when pre-market tracking ends", Order=4, GroupName="5) Key Levels")]
+                public int PreMarketEndHour { get; set; }
+
+                [NinjaScriptProperty]
+                [Range(0, 59)]
+                [Display(Name="Pre-Market End Minute", Description="Minute when pre-market tracking ends", Order=5, GroupName="5) Key Levels")]
+                public int PreMarketEndMinute { get; set; }
+
+                #endregion
+        }
+}
